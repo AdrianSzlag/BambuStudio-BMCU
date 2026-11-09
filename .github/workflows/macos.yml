@@ -1,0 +1,127 @@
+name: Build macOS Universal
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-universal-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: macOS Universal (Intel + Apple Silicon)
+    runs-on: macos-15
+    timeout-minutes: 360
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: 2
+      MACOSX_DEPLOYMENT_TARGET: '10.15'
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+          submodules: recursive
+
+      - name: Install build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install automake texinfo nasm yasm x264 ninja
+          python3 -m venv "$RUNNER_TEMP/cmake-venv"
+          "$RUNNER_TEMP/cmake-venv/bin/python" -m pip install 'cmake==3.31.6'
+          echo "$RUNNER_TEMP/cmake-venv/bin" >> "$GITHUB_PATH"
+
+      - name: Build configuration
+        id: config
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --version
+          xcodebuild -version
+          echo "deps=$(git rev-parse HEAD:deps)" >> "$GITHUB_OUTPUT"
+          version=$(sed -n 's/^set(SLIC3R_VERSION "\([^"]*\)").*/\1/p' version.inc)
+          test -n "$version"
+          echo "VER=${version}-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+
+      - name: Restore dependency cache
+        id: deps
+        uses: actions/cache@v4
+        with:
+          path: deps/build
+          key: macos-15-universal-cmake3.31.6-${{ steps.config.outputs.deps }}-v1
+
+      - name: Build dependencies for both architectures
+        if: steps.deps.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Avoid accidentally linking Homebrew's arm64-only zstd into the Intel build.
+          brew unlink zstd || true
+          ./BuildMac.sh -d -x -a universal -t 10.15
+
+      - name: Build Universal application
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./BuildMac.sh -s -x -a universal -t 10.15 -1
+
+      - name: Merge and verify bundled Mach-O libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+
+          app = Path('build/universal/BambuStudio/BambuStudio.app')
+          assert app.is_dir(), 'Missing application bundle'
+          for target in app.rglob('*'):
+              if not target.is_file() or target.is_symlink():
+                  continue
+              kind = subprocess.check_output(['file', '-b', str(target)], text=True)
+              if 'Mach-O' not in kind:
+                  continue
+              relative = target.relative_to(app)
+              arches = subprocess.check_output(['lipo', '-archs', str(target)], text=True).split()
+              if not {'arm64', 'x86_64'}.issubset(arches):
+                  inputs = [Path(f'build/{arch}/BambuStudio/BambuStudio.app') / relative
+                            for arch in ('x86_64', 'arm64')]
+                  assert all(p.is_file() for p in inputs), f'Missing architecture: {relative}'
+                  subprocess.run(['lipo', '-create', *map(str, inputs), '-output', str(target)], check=True)
+              subprocess.run(['lipo', '-verify_arch', 'x86_64', 'arm64', str(target)], check=True)
+              print(f'Universal: {relative}')
+          PY
+          codesign --force --deep --sign - build/universal/BambuStudio/BambuStudio.app
+          codesign --verify --deep --strict --verbose=2 build/universal/BambuStudio/BambuStudio.app
+
+      - name: Package ZIP and DMG
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          app=build/universal/BambuStudio/BambuStudio.app
+          ditto -c -k --sequesterRsrc --keepParent "$app" "out/BambuStudio-BMCU_macos_universal_${VER}.zip"
+          dmgdir=$(mktemp -d)
+          ditto "$app" "$dmgdir/BambuStudio.app"
+          ln -s /Applications "$dmgdir/Applications"
+          hdiutil create -volname 'BambuStudio BMCU' -srcfolder "$dmgdir" -ov -format UDZO "out/BambuStudio-BMCU_macos_universal_${VER}.dmg"
+          (cd out && shasum -a 256 *.zip *.dmg > SHA256SUMS_macos.txt)
+          {
+            echo '### BambuStudio BMCU for macOS'
+            echo "Version: ${VER}"
+            echo 'Universal application: Intel x86_64 and Apple Silicon arm64.'
+            echo 'Download the artifact below for the DMG, ZIP and SHA-256 checksums.'
+            echo 'Ad-hoc signed; no Apple Developer certificate or notarization.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload macOS downloads
+        uses: actions/upload-artifact@v4
+        with:
+          name: BambuStudio-BMCU-macOS-Universal-${{ env.VER }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 30
