@@ -92,7 +92,7 @@ jobs:
                             for arch in ('x86_64', 'arm64')]
                   assert all(p.is_file() for p in inputs), f'Missing architecture: {relative}'
                   subprocess.run(['lipo', '-create', *map(str, inputs), '-output', str(target)], check=True)
-              subprocess.run(['lipo', '-verify_arch', 'x86_64', 'arm64', str(target)], check=True)
+              subprocess.run(['lipo', str(target), '-verify_arch', 'x86_64', 'arm64'], check=True)
               print(f'Universal: {relative}')
           PY
           codesign --force --deep --sign - build/universal/BambuStudio/BambuStudio.app
