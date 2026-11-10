@@ -82,8 +82,8 @@ jobs:
           for target in app.rglob('*'):
               if not target.is_file() or target.is_symlink():
                   continue
-              kind = subprocess.check_output(['file', '-b', str(target)], text=True)
-              if 'Mach-O' not in kind:
+              kind = subprocess.check_output(['file', '-b', str(target)])
+              if b'Mach-O' not in kind:
                   continue
               relative = target.relative_to(app)
               arches = subprocess.check_output(['lipo', '-archs', str(target)], text=True).split()
